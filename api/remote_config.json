@@ -1,0 +1,20 @@
+{
+  "license": {
+    "title": "用户许可协议",
+    "content": "欢迎评鉴火锅(myHotpot)！\n\n在使用本应用之前，请仔细阅读以下协议：\n\n1. 本应用仅供个人学习和研究使用，请勿用于商业用途。\n\n2. 本应用所有内容均来自互联网，本应用不提供任何内容存储服务。\n\n3. 使用本应用即表示您同意遵守相关法律法规，不得利用本应用从事违法活动。\n\n4. 本应用不承担因使用本应用而产生的任何法律责任。\n\n5. 本应用保留随时修改本协议的权利，修改后的协议将在应用内公布。\n\n点击\"同意\"按钮即表示您已阅读并同意以上协议。",
+    "url": null,
+    "version": 1
+  },
+  "announcement": {
+    "enabled": true,
+    "id": "announcement_20240101",
+    "title": "欢迎评鉴火锅",
+    "content": "感谢您使用 myHotpot！\n\n本应用是一款短剧视频播放器\n\n如有问题，请访问 GitHub 提交 Issue。",
+    "isForced": false,
+    "showEveryTime": false,
+    "confirmText": "我知道了",
+    "cancelText": "关闭",
+    "showCancel": true,
+    "version": 1
+  }
+}
