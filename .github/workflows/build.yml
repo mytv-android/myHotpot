@@ -29,7 +29,7 @@ jobs:
           echo "branch=dev" >> $GITHUB_ENV
         fi
 
-    - name: Checkout code from myDV-Internal
+    - name: Checkout code from myHotpot-Internal
       if: github.event_name == 'workflow_dispatch'
       uses: actions/checkout@v4
       with:
