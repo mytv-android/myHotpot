@@ -1,5 +1,7 @@
 # myHotpot 🍲
 
+<p align="center"><img src="./img/banner.png" alt="myHotpot" width="100%"/></p>
+
 在此感谢L站大佬fish2018的无私分享。
 
 > **短剧爱好者的电视火锅。** 沙发一瘫，遥控器一按，好戏开涮。
