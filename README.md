@@ -76,3 +76,9 @@
 
 有问题请到 [Issues](https://github.com/mytv-android/myhotpot/issues) 提，好用请给个 ⭐。
 
+## 🙏 致谢
+
+苹果源的取流签名（x-argus / x-ladon）参考了
+[openhongguo](https://github.com/beilunyang/openhongguo) 的实现，该项目以
+[Apache License 2.0](https://github.com/beilunyang/openhongguo/blob/main/LICENSE) 发布。
+
