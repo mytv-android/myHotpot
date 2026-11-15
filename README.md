@@ -10,12 +10,12 @@
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.4-7f52ff)](https://github.com/mytv-android/myhotpot)
 [![Compose](https://img.shields.io/badge/Jetpack%20Compose-for%20TV-4285f4)](https://github.com/mytv-android/myhotpot)
 
-一个跑在 Android TV 上的短剧播放器。没有开屏广告，没有算法轰炸，打开就是剧——
+一个跑在 Android 上的短剧播放器，手机、平板、电视都能用。没有开屏广告，没有算法轰炸，打开就是剧——
 遥控器上下左右，就能涮完一整部。
 
 ## 🥘 这是什么锅底
 
-- 📺 **为电视而生**：专为大屏和遥控器设计的 Compose TV 界面，焦点、动效、层级退出都是顺着电视逻辑来的
+- 📺 **手机平板电视同一套界面**：Compose 按屏幕尺寸自适应，大屏遥控器和手机触摸走同一套焦点与播放操作
 - 🧩 **内容源自选合并**：内置多个短剧内容源，开关自己说了算，首启默认只开一个，干净
 - ⚡ **秒播与预加载**：选集切换基本不用等，进度条刚走完，下一集已经涮上了
 - 🎬 **清晰度可调**：480p / 720p / 1080p 随网速切换，默认 1080P
@@ -44,6 +44,27 @@
 | 设置 · 显示、内容源、弹幕、播放、更新 | 观看历史 · 按分集保存，退出仍可继续 |
 | :-: | :-: |
 | ![设置](screenshots/07-settings.png) | ![观看历史](screenshots/08-history.png) |
+
+## 📱 五种形态
+
+同一版本 `1.1.23`，Android 模拟器实拍：手机、平板、电视、折叠屏与双面屏。界面按屏幕尺寸自适应，遥控器、触摸与键盘走同一套焦点与播放操作。
+
+<table>
+  <tr>
+    <td align="center"><img src="screenshots/phone.png" height="430" alt="myHotpot 手机"/><br/><sub>手机 · 1080×2400</sub></td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="screenshots/fold.png" width="430" alt="myHotpot 折叠屏"/><br/><sub>折叠屏 · 2208×1840</sub></td>
+    <td align="center" width="50%"><img src="screenshots/dualscreen.png" width="520" alt="myHotpot 双面屏"/><br/><sub>双面屏 · 2784×1800</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="screenshots/tablet.png" width="380" alt="myHotpot 平板"/><br/><sub>平板 · 2560×1600</sub></td>
+    <td align="center"><img src="screenshots/tv.png" width="430" alt="myHotpot 电视"/><br/><sub>电视 · 1920×1080</sub></td>
+  </tr>
+</table>
 
 ## 🕹 遥控器说明书
 
