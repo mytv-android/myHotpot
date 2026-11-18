@@ -248,7 +248,7 @@ jobs:
                 fail("%s: versionName %s != %s" % (apk.name, package.group(3), version_name))
             if int(package.group(2)) != version_code:
                 fail("%s: versionCode %s != %d" % (apk.name, package.group(2), version_code))
-            sdk = re.search(r"(?m)^sdkVersion:'(\d+)'", badging)
+            sdk = re.search(r"(?m)^(?:minSdkVersion|sdkVersion):'(\d+)'$", badging)
             if not sdk or int(sdk.group(1)) != expected_min_sdk:
                 fail("%s: minSdk %s != %d" % (apk.name, sdk.group(1) if sdk else None, expected_min_sdk))
             if re.search(r"(?m)^application-debuggable\s*$", badging):
