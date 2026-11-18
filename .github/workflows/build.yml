@@ -12,6 +12,11 @@ on:
         - stable
         - beta
         - dev
+      expected_private_sha:
+        description: 'Expected myHotpot-Internal commit SHA (stable only; required; full 40 hex)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   build:
@@ -20,14 +25,24 @@ jobs:
     steps:
     - name: Set branch by release_type
       id: set_branch
+      shell: bash
+      env:
+        RELEASE_TYPE: ${{ github.event.inputs.release_type }}
+        EXPECTED_PRIVATE_SHA: ${{ github.event.inputs.expected_private_sha }}
       run: |
-        if [ "${{ github.event.inputs.release_type }}" = "stable" ]; then
-          echo "branch=main" >> $GITHUB_ENV
-        elif [ "${{ github.event.inputs.release_type }}" = "beta" ]; then
-          echo "branch=beta" >> $GITHUB_ENV
-        else
-          echo "branch=dev" >> $GITHUB_ENV
-        fi
+        set -euo pipefail
+        case "$RELEASE_TYPE" in
+          stable)
+            if ! printf '%s' "$EXPECTED_PRIVATE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::stable requires expected_private_sha to be a full 40-hex commit, got '${EXPECTED_PRIVATE_SHA}'"
+              exit 1
+            fi
+            echo "branch=${EXPECTED_PRIVATE_SHA}" >> "$GITHUB_ENV"
+            ;;
+          beta) echo "branch=beta" >> "$GITHUB_ENV" ;;
+          dev) echo "branch=dev" >> "$GITHUB_ENV" ;;
+          *) echo "::error::unknown release_type '${RELEASE_TYPE}'"; exit 1 ;;
+        esac
 
     - name: Checkout code from myHotpot-Internal
       if: github.event_name == 'workflow_dispatch'
@@ -38,6 +53,27 @@ jobs:
         fetch-depth: 0
         submodules: 'recursive'
         token: ${{ secrets.INTERNAL_REPO_TOKEN }}
+
+    - name: Pin private source commit
+      if: github.event.inputs.release_type == 'stable'
+      shell: bash
+      env:
+        EXPECTED_PRIVATE_SHA: ${{ github.event.inputs.expected_private_sha }}
+      run: |
+        set -euo pipefail
+        if ! printf '%s' "${EXPECTED_PRIVATE_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+          echo "::error::expected_private_sha must be a full 40-hex commit, got '${EXPECTED_PRIVATE_SHA}'"
+          exit 1
+        fi
+        actual="$(git rev-parse HEAD)"
+        echo "checked-out private source commit: ${actual}"
+        echo "private source HEAD: $(git log -1 --format=%H)"
+        if [ "${actual}" != "${EXPECTED_PRIVATE_SHA}" ]; then
+          echo "::error::checked out ${actual}, but expected_private_sha is ${EXPECTED_PRIVATE_SHA}"
+          exit 1
+        fi
+        echo "private_source_sha=${actual}" >> "$GITHUB_ENV"
+        echo "pinned private source commit: ${actual}"
     
     - name: Init Empty Changelog
       run: |
@@ -123,6 +159,163 @@ jobs:
         echo "info_version_code=${{ fromJson(steps.apk-meta-release.outputs.content).elements[0].versionCode }}" >> $GITHUB_ENV
         echo "info_version_name=${{ fromJson(steps.apk-meta-release.outputs.content).elements[0].versionName }}" >> $GITHUB_ENV
     
+    - name: Stage and verify release APKs
+      id: stage_release_apks
+      if: github.event.inputs.release_type == 'stable'
+      shell: bash
+      env:
+        EXPECTED_VERSION_NAME: 1.1.${{ github.run_number }}
+        EXPECTED_VERSION_CODE: ${{ github.run_number }}
+        METADATA_VERSION_NAME: ${{ env.info_version_name }}
+      run: |
+        set -euo pipefail
+        release_dir="app/build/outputs/apk/release"
+        convention_name="1.1.${EXPECTED_VERSION_CODE}"
+        if [ "$EXPECTED_VERSION_NAME" != "$convention_name" ]; then
+          echo "::error::expected versionName ${EXPECTED_VERSION_NAME} is not the 1.1.<run_number> convention (${convention_name})"
+          exit 1
+        fi
+        if [ "$METADATA_VERSION_NAME" != "$EXPECTED_VERSION_NAME" ]; then
+          echo "::error::output-metadata versionName ${METADATA_VERSION_NAME} != the independently derived ${EXPECTED_VERSION_NAME}"
+          exit 1
+        fi
+        stage_dir="$RUNNER_TEMP/staged-apk"
+        rm -rf "$stage_dir"
+        mkdir -p "$stage_dir"
+        sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+        aapt2="$(ls -1 "$sdk"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -n 1 || true)"
+        apksigner="$(ls -1 "$sdk"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1 || true)"
+        if [ -z "$aapt2" ] || [ -z "$apksigner" ]; then
+          echo "::error::aapt2/apksigner not found under the Android SDK build-tools"
+          exit 1
+        fi
+        mapfile -t built < <(find "$release_dir" -maxdepth 1 -type f -name '*.apk' | sort)
+        if [ "${#built[@]}" -ne 4 ]; then
+          echo "::error::expected exactly 4 release APKs in $release_dir, found ${#built[@]}"
+          exit 1
+        fi
+        for apk in "${built[@]}"; do cp -p "$apk" "$stage_dir/"; done
+        python3 - "$stage_dir" "$aapt2" "$apksigner" "$EXPECTED_VERSION_NAME" "$EXPECTED_VERSION_CODE" <<'PY'
+        import hashlib
+        import json
+        import re
+        import subprocess
+        import sys
+        import zipfile
+        from pathlib import Path
+
+        stage = Path(sys.argv[1])
+        aapt2, apksigner = sys.argv[2], sys.argv[3]
+        version_name, version_code = sys.argv[4], int(sys.argv[5])
+        package_name = "com.github.mytv.myhotpot"
+        signer_sha256 = "0d65a406053257268ac43db34e9a3442d8376ff3a1fb2ef73032f05e49af9179"
+        allowed_abis = ("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+        expected_min_sdk = 23
+        debug_tokens = (
+            b"Lcom/github/mytv/myhotpot/core/log/DebugTrace;",
+            b"Lcom/github/mytv/myhotpot/core/network/NetworkTrace;",
+            b"HgRegionProbe", b"diagnostics.log", b"DebugTrace-writer",
+            b"benchmark_candidate", b"ipv4_mapped",
+        )
+
+        def fail(message):
+            print("::error::" + message)
+            sys.exit(1)
+
+        def run(command):
+            done = subprocess.run(command, capture_output=True, text=True)
+            if done.returncode != 0:
+                fail("command failed: %s :: %s" % (" ".join(command), (done.stderr or done.stdout).strip()[:400]))
+            return done.stdout
+
+        apks = sorted(stage.glob("*.apk"))
+        if len(apks) != 4:
+            fail("expected exactly four staged release APKs, found %d" % len(apks))
+        expected_names = {"myHotpot-%s-%s.apk" % (version_name, abi) for abi in allowed_abis}
+        staged_names = {apk.name for apk in apks}
+        if staged_names != expected_names:
+            fail("staged apk names %s != %s" % (sorted(staged_names), sorted(expected_names)))
+        rows, seen = [], {}
+        for apk in apks:
+            data = apk.read_bytes()
+            badging = run([aapt2, "dump", "badging", str(apk)])
+            package = re.search(r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'", badging, re.M)
+            if not package:
+                fail("%s: no package line in aapt2 badging output" % apk.name)
+            if package.group(1) != package_name:
+                fail("%s: package %s != %s" % (apk.name, package.group(1), package_name))
+            if package.group(3) != version_name:
+                fail("%s: versionName %s != %s" % (apk.name, package.group(3), version_name))
+            if int(package.group(2)) != version_code:
+                fail("%s: versionCode %s != %d" % (apk.name, package.group(2), version_code))
+            sdk = re.search(r"(?m)^sdkVersion:'(\d+)'", badging)
+            if not sdk or int(sdk.group(1)) != expected_min_sdk:
+                fail("%s: minSdk %s != %d" % (apk.name, sdk.group(1) if sdk else None, expected_min_sdk))
+            if re.search(r"(?m)^application-debuggable\s*$", badging):
+                fail("%s: application-debuggable is set" % apk.name)
+            native = re.search(r"(?m)^native-code: (.+)$", badging)
+            abis = re.findall(r"'([^']+)'", native.group(1)) if native else []
+            if len(abis) != 1 or abis[0] not in allowed_abis:
+                fail("%s: expected exactly one of %s, found %s" % (apk.name, list(allowed_abis), abis))
+            expected_name = "myHotpot-%s-%s.apk" % (version_name, abis[0])
+            if apk.name != expected_name:
+                fail("%s: apk for ABI %s must be named %s" % (apk.name, abis[0], expected_name))
+            if abis[0] in seen:
+                fail("ABI %s appears in both %s and %s" % (abis[0], seen[abis[0]], apk.name))
+            seen[abis[0]] = apk.name
+            certs = run([apksigner, "verify", "--print-certs", str(apk)])
+            # build-tools <= 36 print "Signer #1 certificate SHA-256 digest: <hex>"; 37 prints
+            # "V2 Signer: certificate SHA-256 digest: <hex>". A single certificate can appear under
+            # more than one signature scheme, so the digest set must be exactly the pinned one; a
+            # second certificate, a numbered second signer or an unparseable output is refused.
+            signers = re.findall(
+                r"(?m)^(?:V\d+ )?Signer(?::| #(\d+)) certificate SHA-256 digest: ([0-9a-f]{64})\s*$",
+                certs)
+            # `re.findall` yields "" — not None — for a group that did not participate in the
+            # match, so presence is tested for truthiness, not with `is not None`.
+            numbers = {number for number, _ in signers if number}
+            digests = {digest for _, digest in signers}
+            if digests != {signer_sha256} or numbers - {"1"}:
+                fail("%s: signer digests %s != exactly one signer with digest %s"
+                     % (apk.name, sorted(digests), signer_sha256))
+            with zipfile.ZipFile(apk) as archive:
+                entries = archive.namelist()
+                if "classes.dex" not in entries:
+                    fail("%s: no root classes.dex" % apk.name)
+                if not archive.read("classes.dex").startswith(b"dex\n"):
+                    fail("%s: root classes.dex does not carry DEX magic" % apk.name)
+                dex = [entry for entry in entries if entry.endswith(".dex")]
+                for entry in dex:
+                    body = archive.read(entry)
+                    for token in debug_tokens:
+                        if token in body:
+                            fail("%s:%s: diagnostic token %r is present" % (apk.name, entry, token))
+            rows.append({"sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
+                         "name": apk.name, "abi": abis[0], "dex": len(dex)})
+        if sorted(seen) != sorted(allowed_abis):
+            fail("ABI set %s != %s" % (sorted(seen), list(allowed_abis)))
+        rows.sort(key=lambda row: row["name"])
+        with (stage / "apk-manifest.tsv").open("w", encoding="utf-8", newline="\n") as handle:
+            for row in rows:
+                handle.write("%s\t%d\t%s\n" % (row["sha256"], row["size"], row["name"]))
+        (stage / "apk-version-name.txt").write_text(version_name + "\n", encoding="utf-8", newline="\n")
+        print(json.dumps({"staged": rows, "abis": sorted(seen)}, ensure_ascii=False))
+        PY
+        (cd "$release_dir" && rm -f -- *.apk && cp -p "$stage_dir"/*.apk .)
+        (cd "$release_dir" && awk -F'\t' '{print $1"  "$3}' "$stage_dir/apk-manifest.tsv" | sha256sum -c -)
+        remaining="$(find "$release_dir" -maxdepth 1 -type f -name '*.apk' | wc -l)"
+        if [ "$remaining" -ne 4 ]; then
+          echo "::error::the publish directory holds $remaining APKs after staging, expected exactly 4"
+          exit 1
+        fi
+        verified_name="$(tr -d '\n' < "$stage_dir/apk-version-name.txt")"
+        if ! printf '%s' "$verified_name" | grep -Eq '^[0-9]+(\.[0-9]+){1,3}$'; then
+          echo "::error::verified version name '${verified_name}' is not a plain dotted version"
+          exit 1
+        fi
+        echo "info_version_name=${verified_name}" >> "$GITHUB_ENV"
+        echo "staged and verified four official release APKs; digests captured before upload"
+
     - name: Gen Tag(Release)
       if: github.event.inputs.release_type == 'stable'
       run: |
@@ -141,17 +334,443 @@ jobs:
         echo "release_title=V${{ env.info_version_name }} 开发版本" >> $GITHUB_ENV
         echo "gitee_repo=mytvdev" >> $GITHUB_ENV
         
-    - name: Publish Release
+    - name: Release preflight
+      id: release_preflight
       if: github.event.inputs.release_type == 'stable'
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-            app/build/outputs/apk/release/*.apk
-        tag_name: V${{ env.info_version_name }}
-        name: ${{ env.release_title }}
-        body: ${{ env.changelog }}
-        generate_release_notes: false
-        make_latest: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RELEASE_TAG: V${{ env.info_version_name }}
+      run: |
+        set -euo pipefail
+        repo="mytv-android/myHotpot"
+        raw="$RUNNER_TEMP/release-list.json"
+        errors="$RUNNER_TEMP/preflight-error.txt"
+        # `releases/tags/<tag>` is a 404 for a draft, so the tag lookup alone cannot see one. The
+        # authenticated release list does include drafts; page it and filter by tag locally.
+        if ! gh api --paginate "repos/${repo}/releases?per_page=100" > "$raw" 2> "$errors"; then
+          echo "::error::release preflight read failed: $(tr '\n' ' ' < "$errors" | cut -c1-300)"
+          exit 1
+        fi
+        matches="$(jq -s --arg tag "$RELEASE_TAG" \
+          '[.[]? | .[]? | select(.tag_name == $tag)]' "$raw")"
+        # A tag can exist with no release object at all, and `POST /releases` against an existing
+        # tag reuses or moves that ref instead of creating the tag this run intends. The exact ref
+        # is read, and its 404 is distinguished from a transport/auth failure (which is fatal
+        # rather than silently "no tag").
+        if gh api "repos/${repo}/git/ref/tags/${RELEASE_TAG}" > "$RUNNER_TEMP/tag-ref.json" 2> "$errors"; then
+          echo "::error::tag ${RELEASE_TAG} already exists in ${repo}; refusing to create or move an existing tag"
+          exit 1
+        fi
+        if ! grep -q 'HTTP 404' "$errors"; then
+          echo "::error::tag preflight read failed and was not a 404: $(tr '\n' ' ' < "$errors" | cut -c1-300)"
+          exit 1
+        fi
+        count="$(printf '%s' "$matches" | jq 'length')"
+        if [ "$count" -eq 0 ]; then
+          echo "no release exists for ${RELEASE_TAG} yet"
+          exit 0
+        fi
+        # One id per word: `join` keeps the list on a single line whatever the platform's jq does
+        # with newlines, and `tostring` makes a non-object id (string, null) printable for the guard.
+        for existing_id in $(printf '%s' "$matches" | jq -r '[.[] | .id | tostring] | join(" ")'); do
+          case "$existing_id" in
+            ''|*[!0-9]*) echo "::error::existing release for ${RELEASE_TAG} has a non-numeric id: ${existing_id}"; exit 1 ;;
+          esac
+        done
+        published_ids="$(printf '%s' "$matches" | jq -r '[.[] | select(.draft | not) | .id] | join(",")')"
+        if [ -n "$published_ids" ]; then
+          echo "::error::release ${RELEASE_TAG} (id=${published_ids}) is already published; refusing to overwrite known good assets"
+          exit 1
+        fi
+        draft_ids="$(printf '%s' "$matches" | jq -r '[.[] | select(.draft) | .id] | join(",")')"
+        echo "::error::a draft release (id=${draft_ids}) already exists for ${RELEASE_TAG}; refusing to delete or overwrite it"
+        exit 1
+
+    - name: Publish Release
+      id: publish_release
+      if: github.event.inputs.release_type == 'stable'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RELEASE_TAG: V${{ env.info_version_name }}
+        RELEASE_NAME: ${{ env.release_title }}
+        RELEASE_BODY: ${{ env.changelog }}
+        PUBLIC_TARGET: ${{ github.sha }}
+        PRIVATE_SOURCE_SHA: ${{ env.private_source_sha }}
+      run: |
+        set -euo pipefail
+        repo="mytv-android/myHotpot"
+        payload="$RUNNER_TEMP/release-create.json"
+        response="$RUNNER_TEMP/release-created.json"
+        errors="$RUNNER_TEMP/release-create-error.txt"
+        # The release/tag must point at the public commit this workflow_dispatch run was started
+        # from. The private source commit is checked out for the build only: it does not exist in
+        # mytv-android/myHotpot, so using it as the target would publish a ref that repository
+        # cannot resolve and would leak the private history into the public repository.
+        if ! printf '%s' "$PUBLIC_TARGET" | grep -Eq '^[0-9a-f]{40}$'; then
+          echo "::error::github.sha is not a full 40-hex public commit: '${PUBLIC_TARGET}'"
+          exit 1
+        fi
+        if ! printf '%s' "$PRIVATE_SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+          echo "::error::the pinned private source commit is not a full 40-hex value: '${PRIVATE_SOURCE_SHA}'"
+          exit 1
+        fi
+        if [ "$PUBLIC_TARGET" = "$PRIVATE_SOURCE_SHA" ]; then
+          echo "::error::the public workflow commit and the private source commit are the same object; refusing to publish private history"
+          exit 1
+        fi
+        if ! printf '%s' "$RELEASE_TAG" | grep -Eq '^V[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "::error::the release tag '${RELEASE_TAG}' is not a Vx.y.z tag"
+          exit 1
+        fi
+        # The selected target must already be a commit this public repository can resolve, so a tag
+        # can never be created against a commit that only the private history contains. Read-only.
+        if ! gh api "repos/${repo}/commits/${PUBLIC_TARGET}" > "$RUNNER_TEMP/public-target.json" 2> "$errors"; then
+          echo "::error::the selected public commit ${PUBLIC_TARGET} is not readable in ${repo}: $(tr '\n' ' ' < "$errors" | cut -c1-300)"
+          exit 1
+        fi
+        jq -e --arg sha "$PUBLIC_TARGET" '(.sha | type) == "string" and .sha == $sha' \
+          "$RUNNER_TEMP/public-target.json" > /dev/null || {
+            echo "::error::the public commit read returned a different sha than ${PUBLIC_TARGET}"
+            exit 1
+          }
+        # The body/name/tag/target are passed to jq as data, never interpolated into the shell
+        # program, so a changelog line cannot break the payload. draft=true keeps the bytes private
+        # until verified.
+        jq -n --arg tag "$RELEASE_TAG" --arg target "$PUBLIC_TARGET" \
+              --arg name "$RELEASE_NAME" --arg body "$RELEASE_BODY" \
+          '{tag_name: $tag, target_commitish: $target, name: $name, body: $body,
+            draft: true, prerelease: false, generate_release_notes: false}' > "$payload"
+        # POST only. This endpoint always creates a new release object: it never updates, reuses or
+        # deletes an existing one, which is exactly the behavior this correction replaces.
+        if ! gh api -X POST "repos/${repo}/releases" --input "$payload" \
+            > "$response" 2> "$errors"; then
+          echo "::error::release creation failed: $(tr '\n' ' ' < "$errors" | cut -c1-300)"
+          echo "no existing release was reused, deleted or modified"
+          exit 1
+        fi
+        # The returned object must be the draft this request asked for, addressed in this repository,
+        # targeting the public commit, and it must report the canonical asset upload url.
+        jq -e --arg tag "$RELEASE_TAG" --arg target "$PUBLIC_TARGET" --arg repo "$repo" '
+          (.id | type) == "number" and .id > 0 and (.id == (.id | floor))
+          and (.tag_name == $tag)
+          and (.draft == true)
+          and (.prerelease == false)
+          and (.target_commitish == $target)
+          and ((.html_url | type) == "string")
+          and (.html_url | startswith("https://github.com/mytv-android/myHotpot/releases/tag/"))
+          and (.upload_url == ("https://uploads.github.com/repos/" + $repo + "/releases/"
+                               + (.id | tostring) + "/assets{?name,label}"))
+          ' "$response" > /dev/null || {
+            echo "::error::the create response is not the requested draft for ${RELEASE_TAG} in mytv-android/myHotpot targeting ${PUBLIC_TARGET}"
+            echo "no existing release was reused, deleted or modified"
+            exit 1
+          }
+        id="$(jq -r '.id' "$response")"
+        url="$(jq -r '.html_url' "$response")"
+        upload_url="$(jq -r '.upload_url' "$response")"
+        {
+          echo "id=${id}"
+          echo "url=${url}"
+          echo "upload_url=${upload_url}"
+          echo "public_target=${PUBLIC_TARGET}"
+          echo "private_source=${PRIVATE_SOURCE_SHA}"
+        } >> "$GITHUB_OUTPUT"
+        printf 'RELEASE_CREATED %s\n' "$(jq -c --arg tag "$RELEASE_TAG" --arg target "$PUBLIC_TARGET" \
+          --arg private "$PRIVATE_SOURCE_SHA" '
+          {id: .id, tag: $tag, url: .html_url, draft: .draft, prerelease: .prerelease,
+           target: $target, targetKind: "public-workflow-dispatch-commit",
+           privateSource: $private, uploadUrl: .upload_url}' "$response")"
+        echo "created draft release ${id} for ${RELEASE_TAG} at ${url} targeting public commit ${PUBLIC_TARGET}"
+
+    - name: Upload release assets
+      id: upload_release_assets
+      if: github.event.inputs.release_type == 'stable'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RELEASE_ID: ${{ steps.publish_release.outputs.id }}
+        UPLOAD_URL: ${{ steps.publish_release.outputs.upload_url }}
+      run: |
+        set -euo pipefail
+        repo="mytv-android/myHotpot"
+        stage_dir="$RUNNER_TEMP/staged-apk"
+        manifest="$stage_dir/apk-manifest.tsv"
+        jsonl="$RUNNER_TEMP/uploaded-assets.jsonl"
+        test -f "$manifest" || { echo "::error::staged apk manifest is missing"; exit 1; }
+        case "$RELEASE_ID" in
+          ''|*[!0-9]*) echo "::error::the release creation reported a non-numeric release id: ${RELEASE_ID}"; exit 1 ;;
+        esac
+        if [ "$RELEASE_ID" -le 0 ]; then
+          echo "::error::the release creation reported release id ${RELEASE_ID}"
+          exit 1
+        fi
+        # Asset uploads live on uploads.github.com, which is not under the REST API root, so the
+        # GitHub CLI's API command cannot address them: its host override selects an enterprise API
+        # root and a different token store instead. The canonical url the create call returned is
+        # re-derived here, exactly, and every POST is built from it.
+        upload_base="https://uploads.github.com/repos/${repo}/releases/${RELEASE_ID}/assets"
+        expected_upload_url="${upload_base}{?name,label}"
+        if [ "$UPLOAD_URL" != "$expected_upload_url" ]; then
+          echo "::error::the creation reported upload url '${UPLOAD_URL}', expected ${expected_upload_url}"
+          exit 1
+        fi
+        : > "$jsonl"
+        count=0
+        while IFS=$'\t' read -r sha size name; do
+          [ -n "$name" ] || continue
+          case "$name" in
+            ''|*[!A-Za-z0-9._-]*) echo "::error::staged asset name '${name}' is not url-safe"; exit 1 ;;
+          esac
+          file="$stage_dir/$name"
+          test -f "$file" || { echo "::error::staged asset ${name} is missing"; exit 1; }
+          actual_size="$(wc -c < "$file" | tr -d ' ')"
+          if [ "$actual_size" -ne "$size" ]; then
+            echo "::error::staged asset ${name} changed size before upload (${actual_size} != ${size})"
+            exit 1
+          fi
+          actual_sha="$(sha256sum "$file" | cut -d' ' -f1)"
+          if [ "$actual_sha" != "$sha" ]; then
+            echo "::error::staged asset ${name} changed digest before upload"
+            exit 1
+          fi
+          response="$RUNNER_TEMP/upload-${count}.json"
+          errors="$RUNNER_TEMP/upload-error-${count}.txt"
+          asset_url="${upload_base}?name=${name}"
+          # The upload endpoint is keyed by the id POST /releases just returned and by the exact
+          # staged name. A duplicate name is a 422 and its body is captured; redirects are refused
+          # and the staged bytes go up unchanged. Nothing is deleted or overwritten afterwards.
+          if ! curl --silent --show-error --fail-with-body --max-redirs 0 --proto-redir '=https' \
+              --request POST \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "Content-Type: application/octet-stream" \
+              --data-binary "@${file}" \
+              "$asset_url" > "$response" 2> "$errors"; then
+            echo "::error::upload of ${name} failed: $(tr '\n' ' ' < "$errors" | cut -c1-300)"
+            echo "::error::upload response body: $(tr '\n' ' ' < "$response" | cut -c1-300)"
+            echo "no existing asset was deleted or overwritten"
+            exit 1
+          fi
+          jq -e --arg name "$name" --argjson size "$size" --arg sha "$sha" '
+            (.id | type) == "number" and .id > 0 and (.id == (.id | floor))
+            and (.name == $name)
+            and (.size == $size)
+            and (.state == "uploaded")
+            and (if (.digest // null) == null
+                 then true
+                 else (.digest == ("sha256:" + $sha)) end)
+            ' "$response" > /dev/null || {
+              echo "::error::the upload response for ${name} is not the staged asset"
+              exit 1
+            }
+          jq -c --arg name "$name" '{name: $name, id: .id, size: .size}' "$response" >> "$jsonl"
+          count=$((count + 1))
+        done < "$manifest"
+        if [ "$count" -ne 4 ]; then
+          echo "::error::uploaded ${count} assets, expected exactly 4"
+          exit 1
+        fi
+        if [ "$(wc -l < "$jsonl" | tr -d ' ')" -ne 4 ]; then
+          echo "::error::the uploaded asset log does not hold exactly 4 records"
+          exit 1
+        fi
+        jq -s 'sort_by(.name)' "$jsonl" > "$RUNNER_TEMP/uploaded-assets.json"
+        jq -e -n --slurpfile uploaded "$RUNNER_TEMP/uploaded-assets.json" '
+          ($uploaded[0]) as $u
+          | (($u | length) == 4) or error("expected four uploaded assets")
+          | (($u | map(.id) | unique | length) == 4) or error("uploaded asset ids are not distinct")
+          | (($u | map(.name) | unique | length) == 4) or error("uploaded asset names are not distinct")
+          | (all($u[]; (.id | type) == "number" and .id > 0 and (.id == (.id | floor))))
+            or error("an uploaded asset id is not a positive integer")
+          | (all($u[]; (.size | type) == "number" and .size > 0))
+            or error("an uploaded asset size is not positive")
+          | true
+          ' > /dev/null
+        jq -c '.[]' "$RUNNER_TEMP/uploaded-assets.json" | while IFS= read -r asset; do
+          printf 'RELEASE_ASSET %s\n' "$asset"
+        done
+        printf 'RELEASE_ASSETS %s\n' "$(jq -c '.' "$RUNNER_TEMP/uploaded-assets.json")"
+        echo "assets=$(jq -c '.' "$RUNNER_TEMP/uploaded-assets.json")" >> "$GITHUB_OUTPUT"
+        echo "uploaded four assets to release ${RELEASE_ID}"
+
+    - name: Verify uploaded release assets
+      id: verify_uploaded_assets
+      if: github.event.inputs.release_type == 'stable'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RELEASE_ID: ${{ steps.publish_release.outputs.id }}
+        RELEASE_URL: ${{ steps.publish_release.outputs.url }}
+        RELEASE_TAG: V${{ env.info_version_name }}
+      run: |
+        set -euo pipefail
+        stage_dir="$RUNNER_TEMP/staged-apk"
+        manifest="$stage_dir/apk-manifest.tsv"
+        test -f "$manifest" || { echo "::error::staged apk manifest is missing"; exit 1; }
+        # The upload step recorded the exact ids GitHub returned for the four POSTed assets; a missing
+        # log means no upload happened, so there is nothing to verify and publishing must not proceed.
+        test -f "$RUNNER_TEMP/uploaded-assets.json" || { echo "::error::the uploaded asset log is missing"; exit 1; }
+        case "$RELEASE_ID" in
+          ''|*[!0-9]*) echo "::error::the release creation reported a non-numeric release id: ${RELEASE_ID}"; exit 1 ;;
+        esac
+        if [ "$RELEASE_ID" -le 0 ]; then
+          echo "::error::the release creation reported release id ${RELEASE_ID}"
+          exit 1
+        fi
+        jq -Rsc 'split("\n") | map(select(length > 0) | split("\t")
+                 | {sha256: .[0], size: (.[1] | tonumber), name: .[2]}) | sort_by(.name)' \
+          "$manifest" > "$RUNNER_TEMP/staged-assets.json"
+        jq -e -n \
+          --slurpfile staged "$RUNNER_TEMP/staged-assets.json" \
+          --slurpfile uploaded "$RUNNER_TEMP/uploaded-assets.json" '
+          ($staged[0]) as $s
+          | ($uploaded[0]) as $a
+          | (($a | type) == "array") or error("the upload step did not record an assets array")
+          | (($a | length) == 4) or error("the upload step recorded \($a | length) uploaded assets, expected 4")
+          | (($s | length) == 4) or error("the staged manifest lists \($s | length) apks, expected 4")
+          | ((($a | map(.name) | sort) == ($s | map(.name) | sort))) or error("uploaded names do not match the staged apks")
+          | ((($a | map(.id) | unique | length) == 4)) or error("uploaded asset ids are not four distinct values")
+          | (all($a[]; (.id | type) == "number" and .id > 0 and (.id == (.id | floor)))) or error("an uploaded asset id is not a positive integer")
+          | (all($a[]; (.size | type) == "number" and .size > 0 and (.size == (.size | floor)))) or error("an uploaded asset size is not a positive integer")
+          | ($s | map({key: .name, value: .size}) | from_entries) as $sizes
+          | ($s | map({key: .name, value: .sha256}) | from_entries) as $digests
+          | (all($a[]; .size == $sizes[.name])) or error("an uploaded asset size differs from the staged bytes")
+          | ([ $a[] | {name: .name, id: .id, size: .size, sha256: $digests[.name]} ] | sort_by(.name)) as $bound
+          | (all($bound[]; (.sha256 | type) == "string" and (.sha256 | test("^[0-9a-f]{64}$")))) or error("staged digests do not cover every uploaded asset")
+          | $bound
+        ' > "$RUNNER_TEMP/bound-assets.json"
+        attempt=0
+        while :; do
+          gh api "repos/mytv-android/myHotpot/releases/${RELEASE_ID}" > "$RUNNER_TEMP/api-draft.json"
+          if jq -e '[.assets[] | (.digest // "") | test("^sha256:[0-9a-f]{64}$")] | all' \
+              "$RUNNER_TEMP/api-draft.json" > /dev/null 2>&1; then
+            break
+          fi
+          attempt=$((attempt + 1))
+          if [ "$attempt" -ge 6 ]; then break; fi
+          sleep 5
+        done
+        jq -e --argjson id "$RELEASE_ID" --arg tag "$RELEASE_TAG" --arg url "$RELEASE_URL" \
+          --slurpfile bound "$RUNNER_TEMP/bound-assets.json" '
+          ($bound[0]) as $b
+          | . as $rel
+          | ($rel.id == $id) or error("the release id \($rel.id) is not the id the creation step reported (\($id))")
+          | ($rel.tag_name == $tag) or error("tag_name \($rel.tag_name) != \($tag)")
+          | ($rel.draft == true) or error("the release was already published before verification")
+          | ($rel.prerelease == false) or error("the release is marked prerelease")
+          | ($rel.html_url | startswith("https://github.com/mytv-android/myHotpot/releases/tag/"))
+            or error("draft html_url \($rel.html_url) is not a release url in mytv-android/myHotpot")
+          | (($url == $rel.html_url)
+              or ($url == ("https://github.com/mytv-android/myHotpot/releases/tag/" + $tag)))
+            or error("the creation url \($url) is neither the draft url \($rel.html_url) nor the tag url for \($tag)")
+          | (($rel.assets | length) == 4) or error("the release carries \($rel.assets | length) assets, expected 4")
+          | (($rel.assets | map(.id) | unique | length) == 4) or error("release asset ids are not unique")
+          | (all($rel.assets[]; (.id | type) == "number" and .id > 0 and (.id == (.id | floor)))) or error("a release asset id is not a positive integer")
+          | (all($rel.assets[]; (.size | type) == "number" and .size > 0)) or error("a release asset size is not positive")
+          | (($rel.assets | map(.name) | sort) == ($b | map(.name) | sort)) or error("release asset names do not match the staged/uploaded set")
+          | ([ $rel.assets[] as $asset
+              | ($b | map(select(.name == $asset.name))) as $match
+              | (($match | length) == 1)
+                and ($asset.id == $match[0].id)
+                and ($asset.size == $match[0].size)
+                and ($asset.digest == ("sha256:" + $match[0].sha256)) ] | all)
+            or error("release assets do not match the uploaded identities and staged digests")
+          | true
+        ' "$RUNNER_TEMP/api-draft.json" > /dev/null
+        echo "verified draft release ${RELEASE_ID}: four uploaded assets match the staged bytes"
+
+    - name: Publish draft release
+      id: publish_draft_release
+      if: github.event.inputs.release_type == 'stable'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RELEASE_ID: ${{ steps.publish_release.outputs.id }}
+        RELEASE_URL: ${{ steps.publish_release.outputs.url }}
+        RELEASE_TAG: V${{ env.info_version_name }}
+      run: |
+        set -euo pipefail
+        case "$RELEASE_ID" in
+          ''|*[!0-9]*) echo "::error::the release creation reported a non-numeric release id: ${RELEASE_ID}"; exit 1 ;;
+        esac
+        if [ "$RELEASE_ID" -le 0 ]; then
+          echo "::error::the release creation reported release id ${RELEASE_ID}"
+          exit 1
+        fi
+        test -f "$RUNNER_TEMP/bound-assets.json" || { echo "::error::the verified asset binding is missing; refusing to publish"; exit 1; }
+        if ! printf '%s' "$RELEASE_URL" | grep -Eq \
+            "^https://github\.com/mytv-android/myHotpot/releases/tag/(V[0-9]+\.[0-9]+\.[0-9]+|untagged-[0-9a-f]+)$"; then
+          echo "::error::the release creation reported url ${RELEASE_URL}, not a release url in mytv-android/myHotpot"
+          exit 1
+        fi
+        published_url="https://github.com/mytv-android/myHotpot/releases/tag/${RELEASE_TAG}"
+        gh api -X PATCH "repos/mytv-android/myHotpot/releases/${RELEASE_ID}" \
+          -f make_latest=true -F draft=false > "$RUNNER_TEMP/published-release.json"
+        jq -e --argjson id "$RELEASE_ID" --arg tag "$RELEASE_TAG" --arg canonical "$published_url" \
+          --slurpfile bound "$RUNNER_TEMP/bound-assets.json" '
+          ($bound[0]) as $b
+          | . as $rel
+          | ($rel.id == $id) or error("the published release id \($rel.id) != \($id)")
+          | ($rel.tag_name == $tag) or error("published tag_name \($rel.tag_name) != \($tag)")
+          | ($rel.draft == false) or error("the release is still a draft after publish")
+          | ($rel.prerelease == false) or error("the published release is marked prerelease")
+          | ($rel.published_at != null) or error("the published release has no published_at")
+          | ($rel.html_url == $canonical) or error("published html_url \($rel.html_url) != \($canonical)")
+          | ([ $rel.assets[] | {name: .name, id: .id, size: .size, digest: .digest} ] | sort_by(.name)) as $got
+          | ([ $b[] | {name: .name, id: .id, size: .size, digest: ("sha256:" + .sha256)} ] | sort_by(.name)) as $want
+          | (all($got[]; (.digest | type) == "string" and (.digest | test("^sha256:[0-9a-f]{64}$"))))
+            or error("a published asset digest is missing or malformed")
+          | ($got == $want) or error("published assets do not match the verified name/id/size/digest tuples")
+          | true
+        ' "$RUNNER_TEMP/published-release.json" > /dev/null
+        echo "published_url=${published_url}" >> "$GITHUB_ENV"
+        printf 'RELEASE_PUBLISHED %s\n' "$(jq -c --arg tag "$RELEASE_TAG" \
+          '{id: .id, tag: $tag, url: .html_url, draft: .draft, prerelease: .prerelease}' \
+          "$RUNNER_TEMP/published-release.json")"
+        echo "published release ${RELEASE_ID} for ${RELEASE_TAG} at ${published_url}"
+
+    - name: Record release evidence
+      id: record_release_evidence
+      if: github.event.inputs.release_type == 'stable'
+      shell: bash
+      env:
+        RELEASE_ID: ${{ steps.publish_release.outputs.id }}
+        RELEASE_URL: ${{ env.published_url }}
+        RELEASE_TAG: V${{ env.info_version_name }}
+        RUN_ID: ${{ github.run_id }}
+        RUN_ATTEMPT: ${{ github.run_attempt }}
+      run: |
+        set -euo pipefail
+        manifest="$RUNNER_TEMP/staged-apk/apk-manifest.tsv"
+        test -f "$manifest" || { echo "::error::staged apk manifest is missing"; exit 1; }
+        test -f "$RUNNER_TEMP/uploaded-assets.json" || { echo "::error::the uploaded asset log is missing"; exit 1; }
+        for pair in "RUN_ID=${RUN_ID}" "RUN_ATTEMPT=${RUN_ATTEMPT}"; do
+          name="${pair%%=*}"
+          value="${pair#*=}"
+          case "$value" in
+            ''|*[!0-9]*) echo "::error::${name} is not a positive integer: ${value}"; exit 1 ;;
+          esac
+          if [ "$value" -le 0 ]; then
+            echo "::error::${name} is not a positive integer: ${value}"
+            exit 1
+          fi
+        done
+        jq -Rsc --arg id "$RELEASE_ID" --arg url "$RELEASE_URL" --arg tag "$RELEASE_TAG" \
+          --argjson runid "$RUN_ID" --argjson attempt "$RUN_ATTEMPT" \
+          --slurpfile uploaded "$RUNNER_TEMP/uploaded-assets.json" '
+          ($uploaded[0]) as $a
+          | (split("\n") | map(select(length > 0)
+              | split("\t") | {sha256: .[0], size: (.[1] | tonumber), name: .[2]})) as $staged
+          | [ $staged[] as $s
+              | [ $a[] | select(.name == $s.name) ] as $m
+              | if ($m | length) != 1 then error("staged asset \($s.name) is not in the uploaded asset list exactly once") else . end
+              | {name: $s.name, id: $m[0].id, size: $s.size, sha256: $s.sha256} ] as $assets
+          | if ($assets | length) != ($staged | length) then error("staged and uploaded asset counts differ") else . end
+          | {sentinel: "RELEASE_EVIDENCE", version: 2, releaseId: ($id | tonumber), tag: $tag,
+             url: $url, published: true, runId: $runid, runAttempt: $attempt,
+             assets: ($assets | sort_by(.name))}
+        ' "$manifest"
 
     - name: Publish Pre-Release
       if: github.event.inputs.release_type == 'beta' || github.event.inputs.release_type == 'dev'
