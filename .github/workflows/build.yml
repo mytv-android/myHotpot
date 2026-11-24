@@ -31,6 +31,11 @@ on:
         required: false
         default: false
         type: boolean
+      draft_only:
+        description: 'Stable only: upload and verify a draft, then stop for device validation.'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build:
@@ -44,6 +49,7 @@ jobs:
         RELEASE_TYPE: ${{ github.event.inputs.release_type }}
         EXPECTED_PRIVATE_SHA: ${{ github.event.inputs.expected_private_sha }}
         PUBLISH_RELEASE: ${{ github.event.inputs.publish_release }}
+        DRAFT_ONLY: ${{ github.event.inputs.draft_only }}
       run: |
         set -euo pipefail
         case "$RELEASE_TYPE" in
@@ -68,6 +74,18 @@ jobs:
           fi
           if ! printf '%s' "$EXPECTED_PRIVATE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::error::candidate mode requires a fixed full 40-hex expected_private_sha"
+            exit 1
+          fi
+        fi
+        # draft_only is a device-validation stop: it only makes sense for a stable draft that the
+        # rest of this workflow is authorized to upload, so publication stays explicitly enabled.
+        if [ "${DRAFT_ONLY}" = "true" ]; then
+          if [ "$RELEASE_TYPE" != "stable" ]; then
+            echo "::error::draft_only=true requires release_type=stable"
+            exit 1
+          fi
+          if [ "${PUBLISH_RELEASE}" != "true" ]; then
+            echo "::error::draft_only=true requires publish_release=true"
             exit 1
           fi
         fi
@@ -864,9 +882,56 @@ jobs:
         ' "$RUNNER_TEMP/api-draft.json" > /dev/null
         echo "verified draft release ${RELEASE_ID}: one arm64-v8a uploaded asset matches the staged bytes"
 
+    - name: Draft ready for device validation
+      if: github.event.inputs.release_type == 'stable' && github.event.inputs.publish_release == 'true' && github.event.inputs.draft_only == 'true'
+      shell: bash
+      env:
+        RELEASE_ID: ${{ steps.publish_release.outputs.id }}
+        RELEASE_TAG: V${{ env.info_version_name }}
+        EXPECTED_PRIVATE_SHA: ${{ github.event.inputs.expected_private_sha }}
+        STAGED_MANIFEST: ${{ runner.temp }}/staged-apk/apk-manifest.tsv
+      run: |
+        set -euo pipefail
+        case "$RELEASE_ID" in
+          ''|*[!0-9]*) echo "::error::the release creation reported a non-numeric release id: ${RELEASE_ID}"; exit 1 ;;
+        esac
+        if [ "$RELEASE_ID" -le 0 ]; then
+          echo "::error::the release creation reported release id ${RELEASE_ID}"
+          exit 1
+        fi
+        if ! printf '%s' "$RELEASE_TAG" | grep -Eq '^V[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "::error::the release tag '${RELEASE_TAG}' is not a Vx.y.z tag"
+          exit 1
+        fi
+        if ! printf '%s' "$EXPECTED_PRIVATE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+          echo "::error::expected_private_sha is not a full 40-hex commit"
+          exit 1
+        fi
+        test -f "$STAGED_MANIFEST" || { echo "::error::staged apk manifest is missing"; exit 1; }
+        manifest_name="$(basename "$STAGED_MANIFEST")"
+        manifest_sha="$(sha256sum "$STAGED_MANIFEST" | cut -d' ' -f1)"
+        manifest_size="$(wc -c < "$STAGED_MANIFEST" | tr -d ' ')"
+        {
+          echo "## Draft ready for device validation"
+          echo ""
+          echo "A draft release was created, its one arm64-v8a asset was uploaded, and the uploaded asset was verified against the staged bytes. Publication was skipped because \`draft_only=true\`; no public release exists yet."
+          echo ""
+          echo "| field | value |"
+          echo "| --- | --- |"
+          echo "| draft release id | \`${RELEASE_ID}\` |"
+          echo "| draft tag | \`${RELEASE_TAG}\` |"
+          echo "| expected private source | \`${EXPECTED_PRIVATE_SHA}\` |"
+          echo "| staged manifest name | \`${manifest_name}\` |"
+          echo "| staged manifest sha256 | \`${manifest_sha}\` |"
+          echo "| staged manifest size | ${manifest_size} |"
+          echo ""
+          echo "Manual publication after device testing must re-read this draft release, verify the same asset id and sha256 against the staged manifest, and only then publish."
+        } >> "$GITHUB_STEP_SUMMARY"
+        echo "draft release ${RELEASE_ID} for ${RELEASE_TAG} is ready for device validation; no public release was created"
+
     - name: Publish draft release
       id: publish_draft_release
-      if: github.event.inputs.release_type == 'stable' && github.event.inputs.publish_release == 'true'
+      if: github.event.inputs.release_type == 'stable' && github.event.inputs.publish_release == 'true' && github.event.inputs.draft_only != 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
@@ -916,7 +981,7 @@ jobs:
 
     - name: Record release evidence
       id: record_release_evidence
-      if: github.event.inputs.release_type == 'stable' && github.event.inputs.publish_release == 'true'
+      if: github.event.inputs.release_type == 'stable' && github.event.inputs.publish_release == 'true' && github.event.inputs.draft_only != 'true'
       shell: bash
       env:
         RELEASE_ID: ${{ steps.publish_release.outputs.id }}
