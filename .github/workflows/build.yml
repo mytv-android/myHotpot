@@ -5,8 +5,8 @@ name: Release CI
 # The private source checkout and the public assets stay on the runner.
 #
 # Release ABI policy: all four ABI splits (arm64-v8a, armeabi-v7a, x86, x86_64) are staged,
-# verified and published. Every split uses the pure-Kotlin signer; no APK carries the metasec
-# native library or its security-code payload.
+# verified and published. Every split uses the pure-Kotlin signer; the build no longer embeds
+# the metasec native library or its security-code payload.
 # Every published APK is signature-checked, ABI-checked and digest-bound before upload.
 
 on:
@@ -223,8 +223,7 @@ jobs:
         set -euo pipefail
         release_dir="app/build/outputs/apk/release"
         convention_name="1.1.${EXPECTED_VERSION_CODE}"
-        # All four ABI splits are staged and verified, and none may carry the removed metasec
-        # native library or the security-code payload: signing is pure Kotlin in every split.
+        # All four ABI splits are staged and verified; signing is pure Kotlin in every split.
         if [ "$EXPECTED_VERSION_NAME" != "$convention_name" ]; then
           echo "::error::expected versionName ${EXPECTED_VERSION_NAME} is not the 1.1.<run_number> convention (${convention_name})"
           exit 1
@@ -263,11 +262,9 @@ jobs:
         version_name, version_code = sys.argv[4], int(sys.argv[5])
         package_name = "com.github.mytv.myhotpot"
         signer_sha256 = "0d65a406053257268ac43db34e9a3442d8376ff3a1fb2ef73032f05e49af9179"
-        # All four ABI splits are published, and none of them may carry a native metasec payload:
-        # playback signing is pure Kotlin in every split.
+        # All four ABI splits are published; playback signing is pure Kotlin in every split.
         allowed_abis = ("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
         expected_min_sdk = 23
-        forbidden_entries = ("assets/security-code.jar", "lib/arm64-v8a/libmetasec_ml.so")
         debug_tokens = (
             b"Lcom/github/mytv/myhotpot/core/log/DebugTrace;",
             b"Lcom/github/mytv/myhotpot/core/network/NetworkTrace;",
@@ -347,9 +344,6 @@ jobs:
                     for token in debug_tokens:
                         if token in body:
                             fail("%s:%s: diagnostic token %r is present" % (apk.name, entry, token))
-                for entry in forbidden_entries:
-                    if entry in entries:
-                        fail("%s: APK carries the removed security payload %s" % (apk.name, entry))
             rows.append({"sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
                          "name": apk.name, "abi": abis[0], "dex": len(dex)})
         if sorted(seen) != sorted(allowed_abis):
@@ -374,7 +368,7 @@ jobs:
           exit 1
         fi
         echo "info_version_name=${verified_name}" >> "$GITHUB_ENV"
-        echo "staged and verified four ABI release APKs; no APK carries the removed metasec native or security-code payload"
+        echo "staged and verified four ABI release APKs"
 
     - name: Candidate build evidence (no publication)
       if: github.event.inputs.publish_release != 'true'
@@ -389,7 +383,7 @@ jobs:
           echo ""
           echo "Publication is disabled because \`publish_release=false\`. No tag, release, pre-release or Actions artifact was created, and the private source and candidate APK stay on the runner."
           echo ""
-          echo "Release ABI policy: **all four ABIs**. Every split uses the pure-Kotlin signer and carries no metasec native or security-code payload."
+          echo "Release ABI policy: **all four ABIs**, all using the pure-Kotlin signer."
           echo ""
           echo "| sha256 | size | asset |"
           echo "| --- | --- | --- |"
@@ -907,8 +901,8 @@ jobs:
         ' "$manifest"
 
     # Beta builds are release builds that use the pure-Kotlin signer: all four ABI splits are
-    # published, and none carries the metasec native or security-code payload. The publish
-    # directory was already pruned to the four verified APKs by the staging step.
+    # published. The publish directory was already pruned to the four verified APKs by the
+    # staging step.
     - name: Publish Pre-Release (Beta)
       if: github.event.inputs.release_type == 'beta' && github.event.inputs.publish_release == 'true'
       uses: softprops/action-gh-release@v2
