@@ -4,10 +4,10 @@ name: Release CI
 # Candidate runs upload no Actions artifact and create no tag, release or pre-release.
 # The private SDK payload, the private source checkout and the public assets stay on the runner.
 #
-# Release ABI policy: the official security factor is pinned to one arm64-v8a native payload,
-# so staging, signature/asset verification and publication are ARM64-only. The other ABI splits
-# produced by the private build are intentionally out of scope and are never published; this is an
-# explicit policy rather than a silent relaxation of the previous four-ABI guard.
+# Release ABI policy: all four ABI splits (arm64-v8a, armeabi-v7a, x86, x86_64) are staged,
+# verified and published. The official security factor payload exists only for arm64-v8a; the
+# other splits run the pure-Kotlin signer and are verified to carry no arm64-only native payload.
+# Every published APK is signature-checked, ABI-checked and digest-bound before upload.
 
 on:
   workflow_dispatch:
@@ -313,9 +313,9 @@ jobs:
         set -euo pipefail
         release_dir="app/build/outputs/apk/release"
         convention_name="1.1.${EXPECTED_VERSION_CODE}"
-        # ARM64-only release policy. The official security factor is pinned to one arm64-v8a
-        # native payload, so only the arm64-v8a split is staged, signature-verified and published.
-        # armeabi-v7a/x86/x86_64 are unsupported and are excluded explicitly, not by omission.
+        # All four ABI splits are staged and verified. The official security factor payload exists
+        # only for arm64-v8a; the other splits run the pure signer and must carry no arm64-only
+        # native payload.
         if [ "$EXPECTED_VERSION_NAME" != "$convention_name" ]; then
           echo "::error::expected versionName ${EXPECTED_VERSION_NAME} is not the 1.1.<run_number> convention (${convention_name})"
           exit 1
@@ -334,9 +334,9 @@ jobs:
           echo "::error::aapt2/apksigner not found under the Android SDK build-tools"
           exit 1
         fi
-        mapfile -t built < <(find "$release_dir" -maxdepth 1 -type f -name '*-arm64-v8a.apk' | sort)
-        if [ "${#built[@]}" -ne 1 ]; then
-          echo "::error::expected exactly one arm64-v8a release APK in $release_dir, found ${#built[@]}"
+        mapfile -t built < <(find "$release_dir" -maxdepth 1 -type f -name '*.apk' | sort)
+        if [ "${#built[@]}" -ne 4 ]; then
+          echo "::error::expected exactly four ABI release APKs in $release_dir, found ${#built[@]}"
           exit 1
         fi
         for apk in "${built[@]}"; do cp -p "$apk" "$stage_dir/"; done
@@ -355,9 +355,9 @@ jobs:
         version_name, version_code = sys.argv[4], int(sys.argv[5])
         package_name = "com.github.mytv.myhotpot"
         signer_sha256 = "0d65a406053257268ac43db34e9a3442d8376ff3a1fb2ef73032f05e49af9179"
-        # ARM64-only release policy: only the pinned arm64-v8a native payload exists, so the
-        # other ABI splits are explicitly out of scope and must never be staged or published.
-        allowed_abis = ("arm64-v8a",)
+        # All four ABI splits are published. The security-code asset is global and must be in
+        # every APK; the metasec native payload exists only in the arm64-v8a split.
+        allowed_abis = ("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
         expected_min_sdk = 23
         # The APK itself must embed the exact pinned inputs, checked against the staged bytes and
         # the fixed digests rather than only at the pre-build staging location.
@@ -371,6 +371,7 @@ jobs:
                 os.environ["EXPECTED_METASEC_NATIVE_SHA256"],
             ),
         }
+        arm64_only_embedded = ("lib/arm64-v8a/libmetasec_ml.so",)
         debug_tokens = (
             b"Lcom/github/mytv/myhotpot/core/log/DebugTrace;",
             b"Lcom/github/mytv/myhotpot/core/network/NetworkTrace;",
@@ -389,8 +390,8 @@ jobs:
             return done.stdout
 
         apks = sorted(stage.glob("*.apk"))
-        if len(apks) != 1:
-            fail("expected exactly one staged arm64-v8a release APK, found %d" % len(apks))
+        if len(apks) != 4:
+            fail("expected exactly four staged ABI release APKs, found %d" % len(apks))
         expected_names = {"myHotpot-%s-%s.apk" % (version_name, abi) for abi in allowed_abis}
         staged_names = {apk.name for apk in apks}
         if staged_names != expected_names:
@@ -450,7 +451,11 @@ jobs:
                     for token in debug_tokens:
                         if token in body:
                             fail("%s:%s: diagnostic token %r is present" % (apk.name, entry, token))
-                for entry, (want_size, want_sha) in expected_embedded.items():
+                required = {
+                    entry: want for entry, want in expected_embedded.items()
+                    if abis[0] == "arm64-v8a" or entry not in arm64_only_embedded
+                }
+                for entry, (want_size, want_sha) in required.items():
                     if entry not in entries:
                         fail("%s: missing embedded security input %s" % (apk.name, entry))
                     body = archive.read(entry)
@@ -460,6 +465,11 @@ jobs:
                     actual_sha = hashlib.sha256(body).hexdigest()
                     if actual_sha != want_sha:
                         fail("%s:%s: embedded SHA-256 does not match the pinned input" % (apk.name, entry))
+                if abis[0] != "arm64-v8a":
+                    for entry in arm64_only_embedded:
+                        if entry in entries:
+                            fail("%s: non-arm64 APK carries the arm64-only payload %s"
+                                 % (apk.name, entry))
             rows.append({"sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
                          "name": apk.name, "abi": abis[0], "dex": len(dex)})
         if sorted(seen) != sorted(allowed_abis):
@@ -474,13 +484,8 @@ jobs:
         (cd "$release_dir" && rm -f -- *.apk && cp -p "$stage_dir"/*.apk .)
         (cd "$release_dir" && awk -F'\t' '{print $1"  "$3}' "$stage_dir/apk-manifest.tsv" | sha256sum -c -)
         remaining="$(find "$release_dir" -maxdepth 1 -type f -name '*.apk' | wc -l)"
-        if [ "$remaining" -ne 1 ]; then
-          echo "::error::the publish directory holds $remaining APKs after staging, expected exactly one arm64-v8a APK"
-          exit 1
-        fi
-        non_arm64="$(find "$release_dir" -maxdepth 1 -type f -name '*.apk' ! -name '*-arm64-v8a.apk' | wc -l)"
-        if [ "$non_arm64" -ne 0 ]; then
-          echo "::error::the publish directory holds $non_arm64 non-arm64-v8a APKs; ARM64-only release policy violated"
+        if [ "$remaining" -ne 4 ]; then
+          echo "::error::the publish directory holds $remaining APKs after staging, expected exactly four ABI APKs"
           exit 1
         fi
         verified_name="$(tr -d '\n' < "$stage_dir/apk-version-name.txt")"
@@ -489,7 +494,7 @@ jobs:
           exit 1
         fi
         echo "info_version_name=${verified_name}" >> "$GITHUB_ENV"
-        echo "staged and verified one official arm64-v8a release APK; embedded security inputs match the pinned sizes and digests"
+        echo "staged and verified four ABI release APKs; embedded security inputs match the pinned sizes and digests, and the arm64-only native payload is confined to arm64-v8a"
 
     - name: Candidate build evidence (no publication)
       if: github.event.inputs.publish_release != 'true'
@@ -504,7 +509,7 @@ jobs:
           echo ""
           echo "Publication is disabled because \`publish_release=false\`. No tag, release, pre-release or Actions artifact was created, and the private SDK payload, private source and candidate APK stay on the runner."
           echo ""
-          echo "Release ABI policy: **arm64-v8a only**. \`armeabi-v7a\`, \`x86\` and \`x86_64\` are unsupported (the official security factor ships one pinned arm64-v8a native payload) and are excluded explicitly."
+          echo "Release ABI policy: **all four ABIs**. \`arm64-v8a\` carries the official security factor; \`armeabi-v7a\`, \`x86\` and \`x86_64\` run the pure-Kotlin signer and carry no arm64-only native payload."
           echo ""
           echo "| sha256 | size | asset |"
           echo "| --- | --- | --- |"
@@ -768,20 +773,20 @@ jobs:
           jq -c --arg name "$name" '{name: $name, id: .id, size: .size}' "$response" >> "$jsonl"
           count=$((count + 1))
         done < "$manifest"
-        if [ "$count" -ne 1 ]; then
-          echo "::error::uploaded ${count} assets, expected exactly one"
+        if [ "$count" -ne 4 ]; then
+          echo "::error::uploaded ${count} assets, expected exactly four"
           exit 1
         fi
-        if [ "$(wc -l < "$jsonl" | tr -d ' ')" -ne 1 ]; then
-          echo "::error::the uploaded asset log does not hold exactly one record"
+        if [ "$(wc -l < "$jsonl" | tr -d ' ')" -ne 4 ]; then
+          echo "::error::the uploaded asset log does not hold exactly four records"
           exit 1
         fi
         jq -s 'sort_by(.name)' "$jsonl" > "$RUNNER_TEMP/uploaded-assets.json"
         jq -e -n --slurpfile uploaded "$RUNNER_TEMP/uploaded-assets.json" '
           ($uploaded[0]) as $u
-          | (($u | length) == 1) or error("expected one uploaded asset")
-          | (($u | map(.id) | unique | length) == 1) or error("uploaded asset ids are not distinct")
-          | (($u | map(.name) | unique | length) == 1) or error("uploaded asset names are not distinct")
+          | (($u | length) == 4) or error("expected four uploaded assets")
+          | (($u | map(.id) | unique | length) == 4) or error("uploaded asset ids are not distinct")
+          | (($u | map(.name) | unique | length) == 4) or error("uploaded asset names are not distinct")
           | (all($u[]; (.id | type) == "number" and .id > 0 and (.id == (.id | floor))))
             or error("an uploaded asset id is not a positive integer")
           | (all($u[]; (.size | type) == "number" and .size > 0))
@@ -793,7 +798,7 @@ jobs:
         done
         printf 'RELEASE_ASSETS %s\n' "$(jq -c '.' "$RUNNER_TEMP/uploaded-assets.json")"
         echo "assets=$(jq -c '.' "$RUNNER_TEMP/uploaded-assets.json")" >> "$GITHUB_OUTPUT"
-        echo "uploaded one arm64-v8a asset to release ${RELEASE_ID}"
+        echo "uploaded four ABI assets to release ${RELEASE_ID}"
 
     - name: Verify uploaded release assets
       id: verify_uploaded_assets
@@ -809,7 +814,7 @@ jobs:
         stage_dir="$RUNNER_TEMP/staged-apk"
         manifest="$stage_dir/apk-manifest.tsv"
         test -f "$manifest" || { echo "::error::staged apk manifest is missing"; exit 1; }
-        # The upload step recorded the exact ids GitHub returned for the one POSTed arm64-v8a asset;
+        # The upload step recorded the exact ids GitHub returned for the four POSTed ABI assets;
         # a missing log means no upload happened, so there is nothing to verify and publishing must
         # not proceed.
         test -f "$RUNNER_TEMP/uploaded-assets.json" || { echo "::error::the uploaded asset log is missing"; exit 1; }
@@ -829,10 +834,10 @@ jobs:
           ($staged[0]) as $s
           | ($uploaded[0]) as $a
           | (($a | type) == "array") or error("the upload step did not record an assets array")
-          | (($a | length) == 1) or error("the upload step recorded \($a | length) uploaded assets, expected 1")
-          | (($s | length) == 1) or error("the staged manifest lists \($s | length) apks, expected 1")
+          | (($a | length) == 4) or error("the upload step recorded \($a | length) uploaded assets, expected 4")
+          | (($s | length) == 4) or error("the staged manifest lists \($s | length) apks, expected 4")
           | ((($a | map(.name) | sort) == ($s | map(.name) | sort))) or error("uploaded names do not match the staged apks")
-          | ((($a | map(.id) | unique | length) == 1)) or error("uploaded asset ids are not one distinct value")
+          | ((($a | map(.id) | unique | length) == 4)) or error("uploaded asset ids are not four distinct values")
           | (all($a[]; (.id | type) == "number" and .id > 0 and (.id == (.id | floor)))) or error("an uploaded asset id is not a positive integer")
           | (all($a[]; (.size | type) == "number" and .size > 0 and (.size == (.size | floor)))) or error("an uploaded asset size is not a positive integer")
           | ($s | map({key: .name, value: .size}) | from_entries) as $sizes
@@ -866,8 +871,8 @@ jobs:
           | (($url == $rel.html_url)
               or ($url == ("https://github.com/mytv-android/myHotpot/releases/tag/" + $tag)))
             or error("the creation url \($url) is neither the draft url \($rel.html_url) nor the tag url for \($tag)")
-          | (($rel.assets | length) == 1) or error("the release carries \($rel.assets | length) assets, expected 1")
-          | (($rel.assets | map(.id) | unique | length) == 1) or error("release asset ids are not unique")
+          | (($rel.assets | length) == 4) or error("the release carries \($rel.assets | length) assets, expected 4")
+          | (($rel.assets | map(.id) | unique | length) == 4) or error("release asset ids are not unique")
           | (all($rel.assets[]; (.id | type) == "number" and .id > 0 and (.id == (.id | floor)))) or error("a release asset id is not a positive integer")
           | (all($rel.assets[]; (.size | type) == "number" and .size > 0)) or error("a release asset size is not positive")
           | (($rel.assets | map(.name) | sort) == ($b | map(.name) | sort)) or error("release asset names do not match the staged/uploaded set")
@@ -880,7 +885,7 @@ jobs:
             or error("release assets do not match the uploaded identities and staged digests")
           | true
         ' "$RUNNER_TEMP/api-draft.json" > /dev/null
-        echo "verified draft release ${RELEASE_ID}: one arm64-v8a uploaded asset matches the staged bytes"
+        echo "verified draft release ${RELEASE_ID}: four ABI uploaded assets match the staged bytes"
 
     - name: Draft ready for device validation
       if: github.event.inputs.release_type == 'stable' && github.event.inputs.publish_release == 'true' && github.event.inputs.draft_only == 'true'
@@ -914,7 +919,7 @@ jobs:
         {
           echo "## Draft ready for device validation"
           echo ""
-          echo "A draft release was created, its one arm64-v8a asset was uploaded, and the uploaded asset was verified against the staged bytes. Publication was skipped because \`draft_only=true\`; no public release exists yet."
+          echo "A draft release was created, its four ABI assets were uploaded, and every uploaded asset was verified against the staged bytes. Publication was skipped because \`draft_only=true\`; no public release exists yet."
           echo ""
           echo "| field | value |"
           echo "| --- | --- |"
@@ -1021,15 +1026,15 @@ jobs:
              assets: ($assets | sort_by(.name))}
         ' "$manifest"
 
-    # Beta builds are release builds that enable the official security factor, so the ARM64-only
-    # policy applies to them too: only the arm64-v8a split is published. Dev builds are debug builds
-    # with no security factor and keep their single debug apk.
-    - name: Publish Pre-Release (Beta, arm64 only)
+    # Beta builds are release builds that enable the official security factor: all four ABI
+    # splits are published, and only arm64-v8a carries the native payload. The publish directory
+    # was already pruned to the four verified APKs by the staging step.
+    - name: Publish Pre-Release (Beta)
       if: github.event.inputs.release_type == 'beta' && github.event.inputs.publish_release == 'true'
       uses: softprops/action-gh-release@v2
       with:
         files: |
-            app/build/outputs/apk/release/*-arm64-v8a.apk
+            app/build/outputs/apk/release/*.apk
         tag_name: V${{ env.info_version_name }}
         name: ${{ env.release_title }}
         body: ${{ env.changelog }}
