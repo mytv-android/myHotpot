@@ -2,11 +2,11 @@ name: Release CI
 
 # Candidate mode is the default: `publish_release=false` builds and verifies only.
 # Candidate runs upload no Actions artifact and create no tag, release or pre-release.
-# The private SDK payload, the private source checkout and the public assets stay on the runner.
+# The private source checkout and the public assets stay on the runner.
 #
 # Release ABI policy: all four ABI splits (arm64-v8a, armeabi-v7a, x86, x86_64) are staged,
-# verified and published. The official security factor payload exists only for arm64-v8a; the
-# other splits run the pure-Kotlin signer and are verified to carry no arm64-only native payload.
+# verified and published. Every split uses the pure-Kotlin signer; no APK carries the metasec
+# native library or its security-code payload.
 # Every published APK is signature-checked, ABI-checked and digest-bound before upload.
 
 on:
@@ -65,8 +65,8 @@ jobs:
           *) echo "::error::unknown release_type '${RELEASE_TYPE}'"; exit 1 ;;
         esac
         # Candidate mode must be a reproducible, pinned build: it only accepts release_type=stable
-        # with a full 40-hex expected_private_sha, so the private source and its ci/security-assets
-        # payload are read at one fixed commit.
+        # with a full 40-hex expected_private_sha, so the private source is read at one fixed
+        # commit.
         if [ "${PUBLISH_RELEASE}" != "true" ]; then
           if [ "$RELEASE_TYPE" != "stable" ]; then
             echo "::error::candidate mode (publish_release=false) requires release_type=stable"
@@ -123,82 +123,6 @@ jobs:
         fi
         echo "private_source_sha=${actual}" >> "$GITHUB_ENV"
         echo "pinned private source commit: ${actual}"
-
-    - name: Check required private SDK secrets are present
-      if: github.event.inputs.release_type != 'dev'
-      shell: bash
-      env:
-        HONGGUO_METASEC_APP_ID: ${{ secrets.HONGGUO_METASEC_APP_ID }}
-        HONGGUO_METASEC_LICENSE: ${{ secrets.HONGGUO_METASEC_LICENSE }}
-        HONGGUO_METASEC_COLLECT_MODE: ${{ secrets.HONGGUO_METASEC_COLLECT_MODE }}
-      run: |
-        set -euo pipefail
-        # Only the secret names are reported; the values are never echoed.
-        missing=0
-        for name in HONGGUO_METASEC_APP_ID HONGGUO_METASEC_LICENSE HONGGUO_METASEC_COLLECT_MODE; do
-          value="${!name:-}"
-          if [ -z "$value" ]; then
-            echo "::error::missing required secret: ${name}"
-            missing=1
-          fi
-        done
-        if [ "$missing" -ne 0 ]; then
-          exit 1
-        fi
-        echo "all required Hongguo SDK secrets are present (values not printed)"
-
-    - name: Stage pinned Hongguo security inputs
-      if: github.event.inputs.release_type != 'dev'
-      shell: bash
-      env:
-        PRIVATE_ASSETS_ROOT: ${{ github.workspace }}/ci/security-assets
-        EXPECTED_SECURITY_CODE_SHA256: dfbdabecf107ec45bfbe5ae3a2ebec9f18bfa658016392713f7a2fb1cac4ed1c
-        EXPECTED_METASEC_NATIVE_SHA256: c6831ab265a0cb76dacfa3b7041e9ea0f706490106a74e12f39058671cc14fe3
-        EXPECTED_METASEC_NATIVE_SIZE: '4501136'
-      run: |
-        set -euo pipefail
-        # The private source checkout carries the pinned security payload under ci/security-assets.
-        # Those bytes are copied to a runner-temp directory outside the repository because the
-        # Gradle security-factor validation refuses inputs located inside the checked-out tree.
-        code_src="$PRIVATE_ASSETS_ROOT/security-code/security-code.jar"
-        jni_src="$PRIVATE_ASSETS_ROOT/jni/arm64-v8a/libmetasec_ml.so"
-        for path in "$code_src" "$jni_src"; do
-          if [ ! -f "$path" ]; then
-            echo "::error::missing private CI input: ci/security-assets/${path#${PRIVATE_ASSETS_ROOT}/}"
-            exit 1
-          fi
-        done
-        code_sha="$(sha256sum "$code_src" | cut -d' ' -f1)"
-        if [ "$code_sha" != "$EXPECTED_SECURITY_CODE_SHA256" ]; then
-          echo "::error::ci/security-assets/security-code/security-code.jar does not match the pinned SHA-256"
-          exit 1
-        fi
-        jni_sha="$(sha256sum "$jni_src" | cut -d' ' -f1)"
-        if [ "$jni_sha" != "$EXPECTED_METASEC_NATIVE_SHA256" ]; then
-          echo "::error::ci/security-assets/jni/arm64-v8a/libmetasec_ml.so does not match the pinned SHA-256"
-          exit 1
-        fi
-        code_size="$(wc -c < "$code_src" | tr -d ' ')"
-        jni_size="$(wc -c < "$jni_src" | tr -d ' ')"
-        if [ "$jni_size" != "$EXPECTED_METASEC_NATIVE_SIZE" ]; then
-          echo "::error::ci/security-assets/jni/arm64-v8a/libmetasec_ml.so size ${jni_size} != expected ${EXPECTED_METASEC_NATIVE_SIZE}"
-          exit 1
-        fi
-        dest="$RUNNER_TEMP/hongguo-security-assets"
-        rm -rf "$dest"
-        mkdir -p "$dest/security-code" "$dest/jni/arm64-v8a"
-        cp -p "$code_src" "$dest/security-code/security-code.jar"
-        cp -p "$jni_src" "$dest/jni/arm64-v8a/libmetasec_ml.so"
-        {
-          echo "HONGGUO_OFFICIAL_SECURITY_FACTOR=true"
-          echo "HONGGUO_METASEC_CODE_DIR=$dest/security-code"
-          echo "HONGGUO_METASEC_JNI_DIR=$dest/jni"
-          echo "HONGGUO_SECURITY_CODE_SHA256=$code_sha"
-          echo "HONGGUO_SECURITY_CODE_SIZE=$code_size"
-          echo "HONGGUO_METASEC_NATIVE_SHA256=$jni_sha"
-          echo "HONGGUO_METASEC_NATIVE_SIZE=$jni_size"
-        } >> "$GITHUB_ENV"
-        echo "staged pinned Hongguo security inputs; digests verified; configuration values not printed"
 
     - name: Init Empty Changelog
       run: |
@@ -257,18 +181,8 @@ jobs:
             SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
             SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
             VERSION_CODE: ${{ github.run_number }}
-            HONGGUO_OFFICIAL_SECURITY_FACTOR: 'true'
-            HONGGUO_METASEC_APP_ID: ${{ secrets.HONGGUO_METASEC_APP_ID }}
-            HONGGUO_METASEC_LICENSE: ${{ secrets.HONGGUO_METASEC_LICENSE }}
-            HONGGUO_METASEC_COLLECT_MODE: ${{ secrets.HONGGUO_METASEC_COLLECT_MODE }}
       run: |
-        # HONGGUO_METASEC_JNI_DIR is read by app/build.gradle.kts ONLY through
-        # providers.gradleProperty("HONGGUO_METASEC_JNI_DIR") (no environmentVariable fallback),
-        # so it must be passed as a Gradle property. The other security inputs accept an env var:
-        # HONGGUO_OFFICIAL_SECURITY_FACTOR, HONGGUO_METASEC_APP_ID, HONGGUO_METASEC_LICENSE,
-        # HONGGUO_METASEC_COLLECT_MODE and HONGGUO_METASEC_CODE_DIR resolve through
-        # gradleProperty ?: environmentVariable.
-        ./gradlew :app:assembleRelease --warning-mode=all -PHONGGUO_METASEC_JNI_DIR="$HONGGUO_METASEC_JNI_DIR"
+        ./gradlew :app:assembleRelease --warning-mode=all
     
     - name: Build with Gradle (Debug)
       if: github.event.inputs.release_type == 'dev'
@@ -305,17 +219,12 @@ jobs:
         EXPECTED_VERSION_NAME: 1.1.${{ github.run_number }}
         EXPECTED_VERSION_CODE: ${{ github.run_number }}
         METADATA_VERSION_NAME: ${{ env.info_version_name }}
-        EXPECTED_SECURITY_CODE_SHA256: ${{ env.HONGGUO_SECURITY_CODE_SHA256 }}
-        EXPECTED_SECURITY_CODE_SIZE: ${{ env.HONGGUO_SECURITY_CODE_SIZE }}
-        EXPECTED_METASEC_NATIVE_SHA256: ${{ env.HONGGUO_METASEC_NATIVE_SHA256 }}
-        EXPECTED_METASEC_NATIVE_SIZE: ${{ env.HONGGUO_METASEC_NATIVE_SIZE }}
       run: |
         set -euo pipefail
         release_dir="app/build/outputs/apk/release"
         convention_name="1.1.${EXPECTED_VERSION_CODE}"
-        # All four ABI splits are staged and verified. The official security factor payload exists
-        # only for arm64-v8a; the other splits run the pure signer and must carry no arm64-only
-        # native payload.
+        # All four ABI splits are staged and verified, and none may carry the removed metasec
+        # native library or the security-code payload: signing is pure Kotlin in every split.
         if [ "$EXPECTED_VERSION_NAME" != "$convention_name" ]; then
           echo "::error::expected versionName ${EXPECTED_VERSION_NAME} is not the 1.1.<run_number> convention (${convention_name})"
           exit 1
@@ -343,7 +252,6 @@ jobs:
         python3 - "$stage_dir" "$aapt2" "$apksigner" "$EXPECTED_VERSION_NAME" "$EXPECTED_VERSION_CODE" <<'PY'
         import hashlib
         import json
-        import os
         import re
         import subprocess
         import sys
@@ -355,23 +263,11 @@ jobs:
         version_name, version_code = sys.argv[4], int(sys.argv[5])
         package_name = "com.github.mytv.myhotpot"
         signer_sha256 = "0d65a406053257268ac43db34e9a3442d8376ff3a1fb2ef73032f05e49af9179"
-        # All four ABI splits are published. The security-code asset is global and must be in
-        # every APK; the metasec native payload exists only in the arm64-v8a split.
+        # All four ABI splits are published, and none of them may carry a native metasec payload:
+        # playback signing is pure Kotlin in every split.
         allowed_abis = ("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
         expected_min_sdk = 23
-        # The APK itself must embed the exact pinned inputs, checked against the staged bytes and
-        # the fixed digests rather than only at the pre-build staging location.
-        expected_embedded = {
-            "assets/security-code.jar": (
-                int(os.environ["EXPECTED_SECURITY_CODE_SIZE"]),
-                os.environ["EXPECTED_SECURITY_CODE_SHA256"],
-            ),
-            "lib/arm64-v8a/libmetasec_ml.so": (
-                int(os.environ["EXPECTED_METASEC_NATIVE_SIZE"]),
-                os.environ["EXPECTED_METASEC_NATIVE_SHA256"],
-            ),
-        }
-        arm64_only_embedded = ("lib/arm64-v8a/libmetasec_ml.so",)
+        forbidden_entries = ("assets/security-code.jar", "lib/arm64-v8a/libmetasec_ml.so")
         debug_tokens = (
             b"Lcom/github/mytv/myhotpot/core/log/DebugTrace;",
             b"Lcom/github/mytv/myhotpot/core/network/NetworkTrace;",
@@ -451,25 +347,9 @@ jobs:
                     for token in debug_tokens:
                         if token in body:
                             fail("%s:%s: diagnostic token %r is present" % (apk.name, entry, token))
-                required = {
-                    entry: want for entry, want in expected_embedded.items()
-                    if abis[0] == "arm64-v8a" or entry not in arm64_only_embedded
-                }
-                for entry, (want_size, want_sha) in required.items():
-                    if entry not in entries:
-                        fail("%s: missing embedded security input %s" % (apk.name, entry))
-                    body = archive.read(entry)
-                    if len(body) != want_size:
-                        fail("%s:%s: embedded size %d != expected %d"
-                             % (apk.name, entry, len(body), want_size))
-                    actual_sha = hashlib.sha256(body).hexdigest()
-                    if actual_sha != want_sha:
-                        fail("%s:%s: embedded SHA-256 does not match the pinned input" % (apk.name, entry))
-                if abis[0] != "arm64-v8a":
-                    for entry in arm64_only_embedded:
-                        if entry in entries:
-                            fail("%s: non-arm64 APK carries the arm64-only payload %s"
-                                 % (apk.name, entry))
+                for entry in forbidden_entries:
+                    if entry in entries:
+                        fail("%s: APK carries the removed security payload %s" % (apk.name, entry))
             rows.append({"sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
                          "name": apk.name, "abi": abis[0], "dex": len(dex)})
         if sorted(seen) != sorted(allowed_abis):
@@ -494,7 +374,7 @@ jobs:
           exit 1
         fi
         echo "info_version_name=${verified_name}" >> "$GITHUB_ENV"
-        echo "staged and verified four ABI release APKs; embedded security inputs match the pinned sizes and digests, and the arm64-only native payload is confined to arm64-v8a"
+        echo "staged and verified four ABI release APKs; no APK carries the removed metasec native or security-code payload"
 
     - name: Candidate build evidence (no publication)
       if: github.event.inputs.publish_release != 'true'
@@ -507,9 +387,9 @@ jobs:
         {
           echo "## Candidate build only (no publication)"
           echo ""
-          echo "Publication is disabled because \`publish_release=false\`. No tag, release, pre-release or Actions artifact was created, and the private SDK payload, private source and candidate APK stay on the runner."
+          echo "Publication is disabled because \`publish_release=false\`. No tag, release, pre-release or Actions artifact was created, and the private source and candidate APK stay on the runner."
           echo ""
-          echo "Release ABI policy: **all four ABIs**. \`arm64-v8a\` carries the official security factor; \`armeabi-v7a\`, \`x86\` and \`x86_64\` run the pure-Kotlin signer and carry no arm64-only native payload."
+          echo "Release ABI policy: **all four ABIs**. Every split uses the pure-Kotlin signer and carries no metasec native or security-code payload."
           echo ""
           echo "| sha256 | size | asset |"
           echo "| --- | --- | --- |"
@@ -1026,9 +906,9 @@ jobs:
              assets: ($assets | sort_by(.name))}
         ' "$manifest"
 
-    # Beta builds are release builds that enable the official security factor: all four ABI
-    # splits are published, and only arm64-v8a carries the native payload. The publish directory
-    # was already pruned to the four verified APKs by the staging step.
+    # Beta builds are release builds that use the pure-Kotlin signer: all four ABI splits are
+    # published, and none carries the metasec native or security-code payload. The publish
+    # directory was already pruned to the four verified APKs by the staging step.
     - name: Publish Pre-Release (Beta)
       if: github.event.inputs.release_type == 'beta' && github.event.inputs.publish_release == 'true'
       uses: softprops/action-gh-release@v2
