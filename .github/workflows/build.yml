@@ -152,9 +152,13 @@ jobs:
       shell: bash
       env:
         PRIVATE_ASSETS_ROOT: ${{ github.workspace }}/ci/security-assets
-        EXPECTED_SECURITY_CODE_SHA256: dfbdabecf107ec45bfbe5ae3a2ebec9f18bfa658016392713f7a2fb1cac4ed1c
+        EXPECTED_SECURITY_CODE_SHA256: 0df99c3dfe12388f0d496d6e4774afecfb9245e4d37b93370e735ff59453d22b
         EXPECTED_METASEC_NATIVE_SHA256: c6831ab265a0cb76dacfa3b7041e9ea0f706490106a74e12f39058671cc14fe3
         EXPECTED_METASEC_NATIVE_SIZE: '4501136'
+        EXPECTED_TN_CODE_SHA256: eb4e3f16d8c73de91c9b3013b20cb7f25fb02e6f9d409c8e0cdec00ddd285dd7
+        EXPECTED_TN_CRONET_SHA256: 35cfcf345a61617e885566767bdcfcab1843106aa23b03f1b082f2c25ea42b09
+        EXPECTED_TN_BORINGSSL_SHA256: b23ac903d5c9635965714fd4a50903d4d57c36627e9cb7b0f8e9f8c39d00e4da
+        EXPECTED_TN_CRYPTO_SHA256: e00af8aea7a2d571eae5b321095301cafed73553fb4788611b5abbba9317305a
       run: |
         set -euo pipefail
         # The private source checkout carries the pinned security payload under ci/security-assets.
@@ -189,10 +193,34 @@ jobs:
         mkdir -p "$dest/security-code" "$dest/jni/arm64-v8a"
         cp -p "$code_src" "$dest/security-code/security-code.jar"
         cp -p "$jni_src" "$dest/jni/arm64-v8a/libmetasec_ml.so"
+        mkdir -p "$dest/tn-network"
+        for spec in \
+          "tn-network/tn-network.jar:TN_CODE" \
+          "jni/arm64-v8a/libsscronet.so:TN_CRONET" \
+          "jni/arm64-v8a/libttboringssl.so:TN_BORINGSSL" \
+          "jni/arm64-v8a/libttcrypto.so:TN_CRYPTO"; do
+          path="${spec%:*}"
+          key="${spec#*:}"
+          source="$PRIVATE_ASSETS_ROOT/$path"
+          expected="EXPECTED_${key}_SHA256"
+          if [ ! -f "$source" ] || [ -L "$source" ]; then
+            echo "::error::missing or linked private CI input: ci/security-assets/$path"
+            exit 1
+          fi
+          actual="$(sha256sum "$source" | cut -d' ' -f1)"
+          if [ "$actual" != "${!expected}" ]; then
+            echo "::error::ci/security-assets/$path does not match the pinned SHA-256"
+            exit 1
+          fi
+          cp -p "$source" "$dest/$path"
+          echo "HONGGUO_${key}_SHA256=$actual" >> "$GITHUB_ENV"
+          echo "HONGGUO_${key}_SIZE=$(wc -c < "$source" | tr -d ' ')" >> "$GITHUB_ENV"
+        done
         {
           echo "HONGGUO_OFFICIAL_SECURITY_FACTOR=true"
           echo "HONGGUO_METASEC_CODE_DIR=$dest/security-code"
           echo "HONGGUO_METASEC_JNI_DIR=$dest/jni"
+          echo "HONGGUO_TN_NETWORK_CODE_DIR=$dest/tn-network"
           echo "HONGGUO_SECURITY_CODE_SHA256=$code_sha"
           echo "HONGGUO_SECURITY_CODE_SIZE=$code_size"
           echo "HONGGUO_METASEC_NATIVE_SHA256=$jni_sha"
@@ -248,9 +276,8 @@ jobs:
           echo "build_type=debug" >> $GITHUB_ENV
         fi
 
-    # VERSION_CODE is github.run_number. A candidate run consumes that version number; the next
-    # publication run is a new build with different bytes and must repeat this verification. A
-    # candidate result is never promoted to a release without re-running the full verification.
+    # VERSION_CODE is github.run_number. draft_only retains this exact signed asset for device
+    # acceptance; publishing that verified draft must not rebuild or replace its asset.
     - name: Build with Gradle (Release)
       if: github.event.inputs.release_type == 'stable' || github.event.inputs.release_type == 'beta'
       env:
@@ -268,7 +295,7 @@ jobs:
         # HONGGUO_OFFICIAL_SECURITY_FACTOR, HONGGUO_METASEC_APP_ID, HONGGUO_METASEC_LICENSE,
         # HONGGUO_METASEC_COLLECT_MODE and HONGGUO_METASEC_CODE_DIR resolve through
         # gradleProperty ?: environmentVariable.
-        ./gradlew :app:assembleRelease --warning-mode=all -PHONGGUO_METASEC_JNI_DIR="$HONGGUO_METASEC_JNI_DIR"
+        ./gradlew :app:assembleRelease --warning-mode=all -PHONGGUO_METASEC_JNI_DIR="$HONGGUO_METASEC_JNI_DIR" -PHONGGUO_TN_NETWORK_CODE_DIR="$HONGGUO_TN_NETWORK_CODE_DIR"
     
     - name: Build with Gradle (Debug)
       if: github.event.inputs.release_type == 'dev'
@@ -309,6 +336,14 @@ jobs:
         EXPECTED_SECURITY_CODE_SIZE: ${{ env.HONGGUO_SECURITY_CODE_SIZE }}
         EXPECTED_METASEC_NATIVE_SHA256: ${{ env.HONGGUO_METASEC_NATIVE_SHA256 }}
         EXPECTED_METASEC_NATIVE_SIZE: ${{ env.HONGGUO_METASEC_NATIVE_SIZE }}
+        EXPECTED_TN_CODE_SHA256: ${{ env.HONGGUO_TN_CODE_SHA256 }}
+        EXPECTED_TN_CODE_SIZE: ${{ env.HONGGUO_TN_CODE_SIZE }}
+        EXPECTED_TN_CRONET_SHA256: ${{ env.HONGGUO_TN_CRONET_SHA256 }}
+        EXPECTED_TN_CRONET_SIZE: ${{ env.HONGGUO_TN_CRONET_SIZE }}
+        EXPECTED_TN_BORINGSSL_SHA256: ${{ env.HONGGUO_TN_BORINGSSL_SHA256 }}
+        EXPECTED_TN_BORINGSSL_SIZE: ${{ env.HONGGUO_TN_BORINGSSL_SIZE }}
+        EXPECTED_TN_CRYPTO_SHA256: ${{ env.HONGGUO_TN_CRYPTO_SHA256 }}
+        EXPECTED_TN_CRYPTO_SIZE: ${{ env.HONGGUO_TN_CRYPTO_SIZE }}
       run: |
         set -euo pipefail
         release_dir="app/build/outputs/apk/release"
@@ -371,6 +406,16 @@ jobs:
                 os.environ["EXPECTED_METASEC_NATIVE_SHA256"],
             ),
         }
+        for entry, key in (
+            ("assets/tn-network.jar", "TN_CODE"),
+            ("lib/arm64-v8a/libsscronet.so", "TN_CRONET"),
+            ("lib/arm64-v8a/libttboringssl.so", "TN_BORINGSSL"),
+            ("lib/arm64-v8a/libttcrypto.so", "TN_CRYPTO"),
+        ):
+            expected_embedded[entry] = (
+                int(os.environ[f"EXPECTED_{key}_SIZE"]),
+                os.environ[f"EXPECTED_{key}_SHA256"],
+            )
         debug_tokens = (
             b"Lcom/github/mytv/myhotpot/core/log/DebugTrace;",
             b"Lcom/github/mytv/myhotpot/core/network/NetworkTrace;",
